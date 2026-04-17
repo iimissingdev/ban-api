@@ -37,6 +37,45 @@ def update_ban():
     ban_records[ban_id] = record
     return {"success": True, "ban_id": ban_id, "status": record["status"]}
 
+@app.route("/ban-records/complete", methods=["POST"])
+def complete_ban():
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    data = request.json or {}
+    ban_id = data.get("ban_id")
+    success = data.get("success")
+
+    if not ban_id:
+        return {"error": "ban_id is required"}, 400
+
+    if ban_id not in ban_records:
+        return {"error": "Not found"}, 404
+
+    record = ban_records[ban_id]
+    action = data.get("action")
+
+    record["processed_by_game"] = True
+    record["processed_at"] = now_iso()
+    record["game_success"] = bool(success)
+    record["game_message"] = data.get("message", "")
+    record["game_place_id"] = data.get("place_id")
+    record["game_job_id"] = data.get("job_id")
+    record["updated_at"] = now_iso()
+
+    if success:
+        if action == "remove":
+            record["status"] = "unbanned"
+        elif action == "edit":
+            record["status"] = "completed"
+        else:
+            record["status"] = "completed"
+    else:
+        record["status"] = "game_failed"
+
+    ban_records[ban_id] = record
+    return {"success": True, "ban_id": ban_id, "status": record["status"]}
+
 
 @app.route("/ban-records/remove", methods=["POST"])
 def remove_ban():
