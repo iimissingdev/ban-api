@@ -18,6 +18,54 @@ def check_auth(req):
     return auth == f"Bearer {BAN_API_KEY}"
 
 
+def parse_expiry(record):
+    duration = str(record.get("duration", "")).lower()
+    created_at = record.get("created_at")
+
+    if duration in {"perm", "permanent"}:
+        return None
+
+    if not created_at:
+        return None
+
+    try:
+        created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    seconds_map = {
+        "1d": 86400,
+        "7d": 604800,
+        "30d": 2592000,
+    }
+
+    seconds = seconds_map.get(duration)
+    if not seconds:
+        return None
+
+    return created_dt.timestamp() + seconds
+
+
+def is_record_active(record):
+    status = str(record.get("status", "")).lower()
+
+    if status in {"denied", "unbanned", "remove_pending"}:
+        return False
+
+    if status not in {"approved", "completed", "edit_pending"}:
+        return False
+
+    duration = str(record.get("duration", "")).lower()
+    if duration in {"perm", "permanent"}:
+        return True
+
+    expiry_ts = parse_expiry(record)
+    if expiry_ts is None:
+        return False
+
+    return datetime.now(timezone.utc).timestamp() < expiry_ts
+
+
 @app.route("/", methods=["GET"])
 def home():
     return "Ban API Running", 200
@@ -30,6 +78,64 @@ def health():
         "status": "ok",
         "records": len(ban_records),
         "time": now_iso()
+    }), 200
+
+
+@app.route("/ban-status/<int:user_id>", methods=["GET"])
+def ban_status(user_id):
+    active_record = None
+
+    for ban_id, record in ban_records.items():
+        try:
+            target_user_id = int(record.get("target_user_id", 0))
+        except Exception:
+            target_user_id = 0
+
+        if target_user_id != user_id:
+            continue
+
+        if is_record_active(record):
+            item = dict(record)
+            item["ban_id"] = ban_id
+            active_record = item
+
+    if not active_record:
+        return jsonify({
+            "active": False,
+            "user_id": user_id
+        }), 200
+
+    return jsonify({
+        "active": True,
+        "user_id": user_id,
+        "ban_id": active_record.get("ban_id"),
+        "duration": active_record.get("duration"),
+        "status": active_record.get("status"),
+        "reason": active_record.get("reason"),
+        "display_reason": f"Automated Ban - {active_record.get('ban_id')}",
+        "target_name": active_record.get("target_name"),
+    }), 200
+
+
+@app.route("/active-bans", methods=["GET"])
+def active_bans():
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    results = []
+    for ban_id, record in ban_records.items():
+        if str(record.get("platform", "")).lower() != "roblox":
+            continue
+
+        if is_record_active(record):
+            item = dict(record)
+            item["ban_id"] = ban_id
+            results.append(item)
+
+    results.sort(key=lambda r: r.get("created_at", ""))
+    return jsonify({
+        "count": len(results),
+        "records": results
     }), 200
 
 
