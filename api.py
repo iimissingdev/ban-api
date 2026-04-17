@@ -2,6 +2,17 @@ from flask import Flask, request, jsonify
 import os
 from datetime import datetime, timezone
 
+app = Flask(__name__)
+BAN_API_KEY = os.getenv("BAN_API_KEY")
+ban_records = {}
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def check_auth(req):
+    auth = req.headers.get("Authorization")
+    return auth == f"Bearer {BAN_API_KEY}"
+
 @app.route("/ban-records/update", methods=["POST"])
 def update_ban():
     if not check_auth(request):
