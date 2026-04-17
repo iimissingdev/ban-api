@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone
 
 app = Flask(__name__)
+print("API file loaded successfully")
 
 BAN_API_KEY = os.getenv("BAN_API_KEY")
 ban_records = {}
@@ -24,6 +25,7 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
+    print("Health route hit")
     return jsonify({
         "status": "ok",
         "records": len(ban_records),
