@@ -70,7 +70,6 @@ def execute_ban():
 
     record = ban_records.get(ban_id)
     if not record:
-        # allow direct bans to create record if it doesn't exist yet
         record = {
             "ban_id": ban_id,
             "created_at": data.get("created_at", now_iso()),
