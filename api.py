@@ -3,7 +3,6 @@ import os
 from datetime import datetime, timezone
 
 app = Flask(__name__)
-print("API file loaded successfully")
 
 BAN_API_KEY = os.getenv("BAN_API_KEY")
 ban_records = {}
@@ -73,7 +72,6 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    print("Health route hit")
     return jsonify({
         "status": "ok",
         "records": len(ban_records),
@@ -114,6 +112,7 @@ def ban_status(user_id):
         "reason": active_record.get("reason"),
         "display_reason": f"Automated Ban - {active_record.get('ban_id')}",
         "target_name": active_record.get("target_name"),
+        "apply_to_universe": True,
     }), 200
 
 
@@ -159,6 +158,8 @@ def create_request():
     data["game_message"] = data.get("game_message")
     data["game_place_id"] = data.get("game_place_id")
     data["game_job_id"] = data.get("game_job_id")
+    data["roblox_enforced"] = data.get("roblox_enforced", False)
+    data["roblox_last_action"] = data.get("roblox_last_action")
 
     ban_records[ban_id] = data
     return {"success": True, "ban_id": ban_id, "status": data["status"]}, 200
@@ -186,25 +187,22 @@ def execute_ban():
     record.update(data)
     record["ban_id"] = ban_id
     record["updated_at"] = now_iso()
-    record["processed_by_game"] = record.get("processed_by_game", False)
-    record["processed_at"] = record.get("processed_at")
-    record["game_success"] = record.get("game_success")
-    record["game_message"] = record.get("game_message")
-    record["game_place_id"] = record.get("game_place_id")
-    record["game_job_id"] = record.get("game_job_id")
+    record["processed_by_game"] = False
+    record["processed_at"] = None
+    record["game_success"] = None
+    record["game_message"] = None
+    record["game_place_id"] = None
+    record["game_job_id"] = None
 
     if action == "approve":
         record["status"] = "approved"
-        record["processed_by_game"] = False
-        record["processed_at"] = None
-        record["game_success"] = None
-        record["game_message"] = None
-        record["game_place_id"] = None
-        record["game_job_id"] = None
+        record["roblox_last_action"] = "approve"
     elif action == "deny":
         record["status"] = "denied"
+        record["roblox_last_action"] = "deny"
     elif record.get("status") is None:
         record["status"] = "approved"
+        record["roblox_last_action"] = "approve"
 
     ban_records[ban_id] = record
     return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
@@ -262,6 +260,7 @@ def update_ban():
     record["game_message"] = None
     record["game_place_id"] = None
     record["game_job_id"] = None
+    record["roblox_last_action"] = "edit"
 
     ban_records[ban_id] = record
     return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
@@ -292,6 +291,7 @@ def remove_ban():
     record["removed_by_discord_id"] = data.get("removed_by_discord_id")
     record["removed_by_name"] = data.get("removed_by_name")
     record["updated_at"] = now_iso()
+    record["roblox_last_action"] = "remove"
 
     ban_records[ban_id] = record
     return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
@@ -304,7 +304,7 @@ def get_game_pending():
 
     results = []
     for ban_id, record in ban_records.items():
-        if record.get("platform") != "roblox":
+        if str(record.get("platform", "")).lower() != "roblox":
             continue
 
         if record.get("status") in {"approved", "edit_pending", "remove_pending"} and not record.get("processed_by_game", False):
@@ -342,6 +342,8 @@ def complete_ban():
     record["game_place_id"] = data.get("place_id")
     record["game_job_id"] = data.get("job_id")
     record["updated_at"] = now_iso()
+    record["roblox_enforced"] = bool(success)
+    record["roblox_last_action"] = action
 
     if success:
         if action == "remove":
