@@ -33,6 +33,8 @@ def parse_expiry(record):
         return None
 
     seconds_map = {
+        "1h": 3600,
+        "12h": 43200,
         "1d": 86400,
         "7d": 604800,
         "30d": 2592000,
