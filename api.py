@@ -65,6 +65,90 @@ def is_record_active(record):
     return datetime.now(timezone.utc).timestamp() < expiry_ts
 
 
+def record_with_ban_id(ban_id, record):
+    item = dict(record)
+    item["ban_id"] = ban_id
+    item["active"] = is_record_active(record)
+    return item
+
+
+def normalize_lookup_value(value):
+    return str(value or "").strip().lower()
+
+
+def generate_manual_ban_id():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    return f"STAFF-{stamp}"
+
+
+def apply_record_defaults(data, ban_id, source="bot"):
+    data["ban_id"] = ban_id
+    data["status"] = data.get("status", "approved")
+    data["source"] = data.get("source", source)
+    data["request_type"] = data.get("request_type", "manual_staff_ban" if source == "manual_staff" else data.get("request_type", "unknown"))
+    data["platform"] = str(data.get("platform", "roblox")).lower()
+    data["duration"] = data.get("duration", "perm")
+    data["created_at"] = data.get("created_at", now_iso())
+    data["updated_at"] = now_iso()
+    data["processed_by_game"] = data.get("processed_by_game", False)
+    data["processed_at"] = data.get("processed_at")
+    data["game_success"] = data.get("game_success")
+    data["game_message"] = data.get("game_message")
+    data["game_place_id"] = data.get("game_place_id")
+    data["game_job_id"] = data.get("game_job_id")
+    data["roblox_enforced"] = data.get("roblox_enforced", False)
+    data["roblox_last_action"] = data.get("roblox_last_action", "manual_staff_ban" if source == "manual_staff" else data.get("roblox_last_action"))
+    return data
+
+
+def find_records_by_user_id(user_id, active_only=False):
+    results = []
+    wanted = str(user_id).strip()
+
+    for ban_id, record in ban_records.items():
+        if str(record.get("platform", "")).lower() != "roblox":
+            continue
+
+        if str(record.get("target_user_id", "")).strip() != wanted:
+            continue
+
+        if active_only and not is_record_active(record):
+            continue
+
+        results.append(record_with_ban_id(ban_id, record))
+
+    results.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return results
+
+
+def find_records_by_username(username, active_only=False):
+    results = []
+    wanted = normalize_lookup_value(username)
+
+    for ban_id, record in ban_records.items():
+        if str(record.get("platform", "")).lower() != "roblox":
+            continue
+
+        target_name = normalize_lookup_value(record.get("target_name"))
+        if target_name != wanted:
+            continue
+
+        if active_only and not is_record_active(record):
+            continue
+
+        results.append(record_with_ban_id(ban_id, record))
+
+    results.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return results
+
+
+def first_record_or_404(records):
+    if not records:
+        return None
+    return records[0]
+
+
+
 @app.route("/", methods=["GET"])
 def home():
     return "Ban API Running", 200
@@ -138,6 +222,27 @@ def active_bans():
     }), 200
 
 
+@app.route("/ban-records/source/<source>", methods=["GET"])
+def records_by_source(source):
+    """List records by source, for example source=bot or source=manual_staff."""
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    wanted = normalize_lookup_value(source)
+    active_only = str(request.args.get("active_only", "false")).lower() in {"1", "true", "yes"}
+
+    results = []
+    for ban_id, record in ban_records.items():
+        if normalize_lookup_value(record.get("source", "bot")) != wanted:
+            continue
+        if active_only and not is_record_active(record):
+            continue
+        results.append(record_with_ban_id(ban_id, record))
+
+    results.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return jsonify({"count": len(results), "records": results}), 200
+
+
 @app.route("/ban-records/request", methods=["POST"])
 def create_request():
     if not check_auth(request):
@@ -148,18 +253,8 @@ def create_request():
     if not ban_id:
         return {"error": "ban_id is required"}, 400
 
-    data["ban_id"] = ban_id
     data["status"] = data.get("status", "pending")
-    data["created_at"] = data.get("created_at", now_iso())
-    data["updated_at"] = now_iso()
-    data["processed_by_game"] = data.get("processed_by_game", False)
-    data["processed_at"] = data.get("processed_at")
-    data["game_success"] = data.get("game_success")
-    data["game_message"] = data.get("game_message")
-    data["game_place_id"] = data.get("game_place_id")
-    data["game_job_id"] = data.get("game_job_id")
-    data["roblox_enforced"] = data.get("roblox_enforced", False)
-    data["roblox_last_action"] = data.get("roblox_last_action")
+    data = apply_record_defaults(data, ban_id, source="bot")
 
     ban_records[ban_id] = data
     return {"success": True, "ban_id": ban_id, "status": data["status"]}, 200
@@ -206,6 +301,123 @@ def execute_ban():
 
     ban_records[ban_id] = record
     return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
+
+
+@app.route("/ban-records/manual", methods=["POST"])
+def create_manual_staff_ban():
+    """Store a regular staff-issued ban so bot/API lookups can find it too.
+
+    Use this when a staff member bans someone outside the SOM bot flow.
+    Required: target_user_id or target_name.
+    Optional: ban_id, target_name, duration, reason, proof, staff_discord_id, staff_name.
+    If ban_id is not provided, the API creates a STAFF-* ID.
+    """
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    data = request.json or {}
+    if not data.get("target_user_id") and not data.get("target_name"):
+        return {"error": "target_user_id or target_name is required"}, 400
+
+    ban_id = data.get("ban_id") or generate_manual_ban_id()
+
+    data["status"] = data.get("status", "approved")
+    data["request_type"] = data.get("request_type", "manual_staff_ban")
+    data["source"] = data.get("source", "manual_staff")
+    data["approved_by_discord_id"] = data.get("approved_by_discord_id") or data.get("staff_discord_id")
+    data["approved_by_name"] = data.get("approved_by_name") or data.get("staff_name")
+    data["adonis_command"] = data.get("adonis_command", "Manual staff ban")
+    data = apply_record_defaults(data, ban_id, source="manual_staff")
+
+    ban_records[ban_id] = data
+    return jsonify({
+        "success": True,
+        "ban_id": ban_id,
+        "status": data["status"],
+        "source": data["source"],
+    }), 200
+
+
+@app.route("/ban-records/staff", methods=["POST"])
+def create_manual_staff_ban_alias():
+    """Alias for /ban-records/manual."""
+    return create_manual_staff_ban()
+
+
+@app.route("/ban-records/roblox/<int:user_id>", methods=["GET"])
+def get_ban_by_roblox_user_id(user_id):
+    """Return the newest Roblox ban record for a Roblox user ID.
+
+    This is the route the Discord bot tries first for username appeal lookup
+    after resolving a Roblox username into a Roblox numeric user ID.
+    """
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    active_only = str(request.args.get("active_only", "false")).lower() in {"1", "true", "yes"}
+    records = find_records_by_user_id(user_id, active_only=active_only)
+    record = first_record_or_404(records)
+
+    if not record:
+        return {"error": "Not found", "records": []}, 404
+
+    return jsonify(record), 200
+
+
+@app.route("/ban-records/user/<int:user_id>", methods=["GET"])
+def get_ban_by_user_id_alias(user_id):
+    """Alias for /ban-records/roblox/<user_id> for bot compatibility."""
+    return get_ban_by_roblox_user_id(user_id)
+
+
+@app.route("/ban-records/search", methods=["GET"])
+def search_ban_records():
+    """Search ban records by Roblox target_user_id or target_name.
+
+    Supported query params:
+    - platform=roblox
+    - target_user_id=<roblox user id>
+    - target_name=<roblox username>
+    - active_only=true/false
+    """
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    platform = normalize_lookup_value(request.args.get("platform", "roblox"))
+    if platform and platform != "roblox":
+        return jsonify({"count": 0, "records": []}), 200
+
+    active_only = str(request.args.get("active_only", "false")).lower() in {"1", "true", "yes"}
+    target_user_id = request.args.get("target_user_id")
+    target_name = request.args.get("target_name")
+
+    if target_user_id:
+        records = find_records_by_user_id(target_user_id, active_only=active_only)
+    elif target_name:
+        records = find_records_by_username(target_name, active_only=active_only)
+    else:
+        return {"error": "target_user_id or target_name is required"}, 400
+
+    return jsonify({
+        "count": len(records),
+        "records": records
+    }), 200
+
+
+@app.route("/ban-records/by-name/<username>", methods=["GET"])
+def get_ban_by_username(username):
+    """Return the newest Roblox ban record for an exact Roblox username."""
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    active_only = str(request.args.get("active_only", "false")).lower() in {"1", "true", "yes"}
+    records = find_records_by_username(username, active_only=active_only)
+    record = first_record_or_404(records)
+
+    if not record:
+        return {"error": "Not found", "records": []}, 404
+
+    return jsonify(record), 200
 
 
 @app.route("/ban-records/<ban_id>", methods=["GET"])
