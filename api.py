@@ -1,5 +1,9 @@
 from flask import Flask, request, jsonify
 import os
+import json
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from datetime import datetime, timezone
 
 app = Flask(__name__)
@@ -149,6 +153,158 @@ def first_record_or_404(records):
         return None
     return records[0]
 
+
+# Roblox Open Cloud DataStore settings.
+# These let Discord /history read the permanent in-game DataStore history instead
+# of relying on Railway/API RAM.
+ROBLOX_OPEN_CLOUD_API_KEY = os.getenv("ROBLOX_OPEN_CLOUD_API_KEY", "").strip()
+ROBLOX_UNIVERSE_ID = os.getenv("ROBLOX_UNIVERSE_ID", "").strip()
+ROBLOX_HISTORY_DATASTORE_NAME = os.getenv("ROBLOX_HISTORY_DATASTORE_NAME", "SOM_BanHistory_v1").strip()
+ROBLOX_HISTORY_DATASTORE_SCOPE = os.getenv("ROBLOX_HISTORY_DATASTORE_SCOPE", "global").strip()
+
+
+def roblox_history_key(user_id):
+    return f"User_{int(user_id)}"
+
+
+def roblox_open_cloud_headers():
+    return {
+        "x-api-key": ROBLOX_OPEN_CLOUD_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def require_roblox_open_cloud_config():
+    missing = []
+    if not ROBLOX_OPEN_CLOUD_API_KEY:
+        missing.append("ROBLOX_OPEN_CLOUD_API_KEY")
+    if not ROBLOX_UNIVERSE_ID:
+        missing.append("ROBLOX_UNIVERSE_ID")
+    if not ROBLOX_HISTORY_DATASTORE_NAME:
+        missing.append("ROBLOX_HISTORY_DATASTORE_NAME")
+    if missing:
+        return "Missing environment variable(s): " + ", ".join(missing)
+    return None
+
+
+def http_get_json_with_headers(url, headers):
+    req = Request(url, method="GET", headers=headers)
+    try:
+        with urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            if not body:
+                return {}
+            return json.loads(body)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Roblox Open Cloud HTTP {e.code}: {body}")
+    except URLError as e:
+        raise RuntimeError(f"Roblox Open Cloud request failed: {e}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Roblox Open Cloud returned invalid JSON: {e}")
+
+
+def parse_roblox_datastore_value(raw):
+    """Normalize Open Cloud DataStore get-entry responses.
+
+    The in-game worker stores a Lua table like:
+    { user_id = 123, target_name = "Name", records = [...] }
+
+    Open Cloud can return that value directly as an object, or wrapped in a
+    response field such as value/content depending on endpoint/version.
+    """
+    if raw is None:
+        return None
+
+    if isinstance(raw, dict):
+        # v2 commonly wraps the stored value in a value field.
+        for key in ("value", "content", "data"):
+            if key in raw:
+                value = raw.get(key)
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except Exception:
+                        return value
+                return value
+
+        # v1 may return the entry value directly.
+        if "records" in raw or "user_id" in raw:
+            return raw
+
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+
+    return raw
+
+
+def get_roblox_datastore_history(user_id):
+    """Read permanent ban history from Roblox DataStore through Open Cloud."""
+    config_error = require_roblox_open_cloud_config()
+    if config_error:
+        raise RuntimeError(config_error)
+
+    entry_key = roblox_history_key(user_id)
+    universe = quote(str(ROBLOX_UNIVERSE_ID), safe="")
+    store = quote(ROBLOX_HISTORY_DATASTORE_NAME, safe="")
+    scope = quote(ROBLOX_HISTORY_DATASTORE_SCOPE or "global", safe="")
+    key = quote(entry_key, safe="")
+
+    headers = roblox_open_cloud_headers()
+
+    # Preferred current Open Cloud v2 endpoint.
+    v2_url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{universe}"
+        f"/data-stores/{store}/scopes/{scope}/entries/{key}"
+    )
+
+    # Compatibility fallback for older DataStores v1 endpoint.
+    v1_url = (
+        f"https://apis.roblox.com/datastores/v1/universes/{universe}"
+        f"/standard-datastores/datastore/entries/entry"
+        f"?datastoreName={store}&entryKey={key}&scope={scope}"
+    )
+
+    last_error = None
+    for url in (v2_url, v1_url):
+        try:
+            raw = http_get_json_with_headers(url, headers)
+            parsed = parse_roblox_datastore_value(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"user_id": int(user_id), "records": []}
+        except Exception as e:
+            last_error = str(e)
+            # If the key is missing, treat it as no history instead of a hard failure.
+            if "404" in last_error or "NOT_FOUND" in last_error.upper() or "not found" in last_error.lower():
+                return {"user_id": int(user_id), "records": []}
+
+    raise RuntimeError(last_error or "Unable to read Roblox DataStore history")
+
+
+def normalize_history_records_from_datastore(user_id, data):
+    if not isinstance(data, dict):
+        return []
+
+    records = data.get("records")
+    if not isinstance(records, list):
+        records = []
+
+    normalized = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        record = dict(item)
+        record["target_user_id"] = record.get("target_user_id") or data.get("user_id") or int(user_id)
+        record["target_name"] = record.get("target_name") or data.get("target_name") or "Unknown"
+        record["active"] = False
+        normalized.append(record)
+
+    normalized.sort(key=lambda r: r.get("processed_at") or r.get("created_at") or "", reverse=True)
+    return normalized
 
 
 @app.route("/", methods=["GET"])
@@ -420,6 +576,50 @@ def get_ban_by_username(username):
         return {"error": "Not found", "records": []}, 404
 
     return jsonify(record), 200
+
+
+@app.route("/ban-records/history/roblox/<int:user_id>", methods=["GET"])
+def get_ban_history_from_roblox_datastore(user_id):
+    """Return permanent ban history saved by the Roblox in-game DataStore worker."""
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    try:
+        data = get_roblox_datastore_history(user_id)
+        records = normalize_history_records_from_datastore(user_id, data)
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to read Roblox DataStore history",
+            "details": str(e),
+            "records": []
+        }), 500
+
+    return jsonify({
+        "count": len(records),
+        "user_id": user_id,
+        "target_name": data.get("target_name") if isinstance(data, dict) else None,
+        "source": "roblox_datastore",
+        "datastore": ROBLOX_HISTORY_DATASTORE_NAME,
+        "records": records,
+    }), 200
+
+
+@app.route("/ban-records/history/<int:user_id>", methods=["GET"])
+def get_ban_history_alias(user_id):
+    """Alias used by the Discord bot."""
+    return get_ban_history_from_roblox_datastore(user_id)
+
+
+@app.route("/ban-records/roblox/<int:user_id>/history", methods=["GET"])
+def get_ban_history_roblox_suffix_alias(user_id):
+    """Alias used by the Discord bot."""
+    return get_ban_history_from_roblox_datastore(user_id)
+
+
+@app.route("/ban-records/user/<int:user_id>/history", methods=["GET"])
+def get_ban_history_user_suffix_alias(user_id):
+    """Alias used by the Discord bot."""
+    return get_ban_history_from_roblox_datastore(user_id)
 
 
 @app.route("/ban-records/<ban_id>", methods=["GET"])
