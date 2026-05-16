@@ -159,6 +159,7 @@ def first_record_or_404(records):
 # of relying on Railway/API RAM.
 ROBLOX_OPEN_CLOUD_API_KEY = os.getenv("ROBLOX_OPEN_CLOUD_API_KEY", "").strip()
 ROBLOX_UNIVERSE_ID = os.getenv("ROBLOX_UNIVERSE_ID", "").strip()
+ROBLOX_PLACE_ID = os.getenv("ROBLOX_PLACE_ID", "").strip()
 ROBLOX_HISTORY_DATASTORE_NAME = os.getenv("ROBLOX_HISTORY_DATASTORE_NAME", "SOM_BanHistory_v1").strip()
 ROBLOX_HISTORY_DATASTORE_SCOPE = os.getenv("ROBLOX_HISTORY_DATASTORE_SCOPE", "global").strip()
 
@@ -307,13 +308,97 @@ def normalize_history_records_from_datastore(user_id, data):
     return normalized
 
 
-def roblox_get_user_restriction(user_id):
-    """Return one active/manual Roblox universe ban from Open Cloud, if present.
+def _restriction_matches_user(user_id, item):
+    if not isinstance(item, dict):
+        return False
 
-    This is used as a fallback for /checkban so bans created manually in the
-    Creator Hub ban dashboard or through Roblox/Open Cloud can still show up
-    even when they were not created by the Discord bot and therefore do not
-    exist in ban_records.
+    wanted = str(int(user_id))
+    possible_values = [
+        item.get("user"),
+        item.get("userId"),
+        item.get("user_id"),
+        item.get("targetUserId"),
+        item.get("target_user_id"),
+        item.get("name"),
+        item.get("path"),
+        item.get("id"),
+    ]
+
+    restriction = item.get("gameJoinRestriction") or item.get("restriction") or item.get("userRestriction")
+    if isinstance(restriction, dict):
+        possible_values.extend([
+            restriction.get("user"),
+            restriction.get("userId"),
+            restriction.get("user_id"),
+            restriction.get("targetUserId"),
+            restriction.get("target_user_id"),
+        ])
+
+    for value in possible_values:
+        if value is None:
+            continue
+        text = str(value)
+        if text == wanted or text.endswith("/" + wanted) or f"users/{wanted}" in text:
+            return True
+
+    return False
+
+
+def _extract_restriction_items(raw):
+    if not isinstance(raw, dict):
+        return []
+
+    for key in ("userRestrictions", "user_restrictions", "restrictions", "items", "results", "data"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+
+    return []
+
+
+def _list_user_restrictions(url_base, user_id):
+    """List restrictions and find a user when direct GET fails.
+
+    Roblox's docs expose both Get and List User Restrictions. Some dashboards
+    and API responses are easier to find through the list endpoint, so this
+    paginates a small amount and matches the user id client-side.
+    """
+    headers = roblox_open_cloud_headers()
+    page_token = ""
+    last_error = None
+
+    for _ in range(10):
+        separator = "&" if "?" in url_base else "?"
+        url = f"{url_base}{separator}maxPageSize=100"
+        if page_token:
+            url += f"&pageToken={quote(page_token, safe='')}"
+
+        try:
+            raw = http_get_json_with_headers(url, headers)
+        except Exception as e:
+            last_error = str(e)
+            break
+
+        for item in _extract_restriction_items(raw):
+            if _restriction_matches_user(user_id, item):
+                return item
+
+        page_token = raw.get("nextPageToken") or raw.get("next_page_token") or ""
+        if not page_token:
+            break
+
+    if last_error:
+        raise RuntimeError(last_error)
+
+    return None
+
+
+def roblox_get_user_restriction(user_id):
+    """Return one active/manual Roblox ban from Open Cloud, if present.
+
+    Checks universe-level restrictions first, then optional place-level
+    restrictions when ROBLOX_PLACE_ID is configured, and finally falls back to
+    List User Restrictions to find dashboard/manual bans.
     """
     config_error = require_roblox_open_cloud_config()
     if config_error:
@@ -321,18 +406,41 @@ def roblox_get_user_restriction(user_id):
 
     universe = quote(str(ROBLOX_UNIVERSE_ID), safe="")
     restriction_id = quote(str(int(user_id)), safe="")
-    url = (
-        f"https://apis.roblox.com/cloud/v2/universes/{universe}"
-        f"/user-restrictions/{restriction_id}"
-    )
+    headers = roblox_open_cloud_headers()
 
-    try:
-        return http_get_json_with_headers(url, roblox_open_cloud_headers())
-    except Exception as e:
-        text = str(e)
-        if "404" in text or "NOT_FOUND" in text.upper() or "not found" in text.lower():
-            return None
-        raise
+    bases = [
+        f"https://apis.roblox.com/cloud/v2/universes/{universe}/user-restrictions",
+    ]
+
+    if ROBLOX_PLACE_ID:
+        place = quote(str(ROBLOX_PLACE_ID), safe="")
+        bases.append(
+            f"https://apis.roblox.com/cloud/v2/universes/{universe}/places/{place}/user-restrictions"
+        )
+
+    errors = []
+    for base in bases:
+        direct_url = f"{base}/{restriction_id}"
+        try:
+            raw = http_get_json_with_headers(direct_url, headers)
+            if raw:
+                return raw
+        except Exception as e:
+            text = str(e)
+            if "404" not in text and "NOT_FOUND" not in text.upper() and "not found" not in text.lower():
+                errors.append(text)
+
+        try:
+            raw = _list_user_restrictions(base, user_id)
+            if raw:
+                return raw
+        except Exception as e:
+            errors.append(str(e))
+
+    if errors:
+        raise RuntimeError(" ; ".join(errors))
+
+    return None
 
 
 def _pick_first(*values):
@@ -347,13 +455,26 @@ def normalize_open_cloud_restriction(user_id, raw):
     if not isinstance(raw, dict) or not raw:
         return None
 
-    restriction = raw.get("gameJoinRestriction") or raw.get("restriction") or raw.get("userRestriction") or raw
+    # GET can return the restriction directly, nested under gameJoinRestriction,
+    # or as an item from List User Restrictions.
+    restriction = (
+        raw.get("gameJoinRestriction")
+        or raw.get("restriction")
+        or raw.get("userRestriction")
+        or raw.get("user_restriction")
+        or raw
+    )
     if not isinstance(restriction, dict):
         restriction = raw
 
-    active = restriction.get("active")
-    if active is None:
-        active = raw.get("active")
+    active = _pick_first(
+        restriction.get("active"),
+        raw.get("active"),
+        raw.get("isActive"),
+        raw.get("currentlyActive"),
+    )
+    if isinstance(active, str):
+        active = active.strip().lower() in {"true", "1", "yes", "active"}
 
     display_reason = _pick_first(
         restriction.get("displayReason"),
@@ -370,7 +491,11 @@ def normalize_open_cloud_restriction(user_id, raw):
 
     duration = _pick_first(
         restriction.get("duration"),
+        restriction.get("durationSeconds"),
+        restriction.get("duration_seconds"),
         raw.get("duration"),
+        raw.get("durationSeconds"),
+        raw.get("duration_seconds"),
         "Unknown",
     )
 
@@ -379,6 +504,8 @@ def normalize_open_cloud_restriction(user_id, raw):
         raw.get("createdTime"),
         raw.get("created_at"),
         raw.get("create_time"),
+        restriction.get("createTime"),
+        restriction.get("createdTime"),
         raw.get("updateTime"),
         raw.get("updated_at"),
         now_iso(),
@@ -389,16 +516,18 @@ def normalize_open_cloud_restriction(user_id, raw):
         raw.get("updatedTime"),
         raw.get("updated_at"),
         raw.get("update_time"),
+        restriction.get("updateTime"),
+        restriction.get("updatedTime"),
         created_at,
     )
 
     status = "completed" if active is True else "unbanned" if active is False else "unknown"
 
-    # Roblox stores manual/dashboard bans outside this API's RAM, so create a stable display id.
     ban_id = _pick_first(
         raw.get("ban_id"),
         raw.get("id"),
         raw.get("name"),
+        raw.get("path"),
         f"ROBLOX-{int(user_id)}",
     )
 
@@ -407,7 +536,7 @@ def normalize_open_cloud_restriction(user_id, raw):
         "status": status,
         "request_type": "roblox_manual_or_dashboard_ban",
         "platform": "roblox",
-        "target_name": raw.get("target_name") or "Roblox User",
+        "target_name": raw.get("target_name") or raw.get("username") or "Roblox User",
         "target_user_id": int(user_id),
         "duration": duration,
         "reason": private_reason or display_reason or "No reason provided.",
@@ -421,6 +550,7 @@ def normalize_open_cloud_restriction(user_id, raw):
         "active": active is True,
         "roblox_enforced": True,
         "source": "roblox_open_cloud",
+        "raw_open_cloud": raw,
     }
 
 
@@ -441,6 +571,9 @@ def health():
     return jsonify({
         "status": "ok",
         "records": len(ban_records),
+        "open_cloud_configured": not bool(require_roblox_open_cloud_config()),
+        "universe_id_configured": bool(ROBLOX_UNIVERSE_ID),
+        "place_id_configured": bool(ROBLOX_PLACE_ID),
         "time": now_iso()
     }), 200
 
@@ -645,10 +778,11 @@ def get_ban_by_roblox_user_id(user_id):
             record = lookup_open_cloud_ban_record_by_user_id(user_id)
         except Exception as e:
             return jsonify({
-                "error": "Not found in bot records and failed to check Roblox Open Cloud",
+                "error": "Failed to check Roblox Open Cloud User Restrictions",
                 "details": str(e),
+                "hint": "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and make sure the key has user-restrictions read access for this universe.",
                 "records": []
-            }), 404
+            }), 502
 
     if not record:
         return {"error": "Not found", "records": []}, 404
@@ -695,7 +829,8 @@ def search_ban_records():
                     "count": 0,
                     "records": [],
                     "open_cloud_error": str(e),
-                }), 200
+                    "hint": "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions read access."
+                }), 502
     elif target_name:
         records = find_records_by_username(target_name, active_only=active_only)
     else:
@@ -705,6 +840,21 @@ def search_ban_records():
         "count": len(records),
         "records": records
     }), 200
+
+
+@app.route("/ban-records/active/roblox/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/current/roblox/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/active/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/current/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/restriction/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/restrictions/<int:user_id>", methods=["GET"])
+@app.route("/ban-records/roblox/<int:user_id>/active", methods=["GET"])
+@app.route("/ban-records/roblox/<int:user_id>/current", methods=["GET"])
+@app.route("/ban-records/user/<int:user_id>/active", methods=["GET"])
+@app.route("/ban-records/user/<int:user_id>/current", methods=["GET"])
+def get_active_ban_aliases(user_id):
+    """Aliases for Discord bot active/current ban lookup."""
+    return get_ban_by_roblox_user_id(user_id)
 
 
 @app.route("/ban-records/by-name/<username>", methods=["GET"])
