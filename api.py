@@ -10,6 +10,7 @@ app = Flask(__name__)
 
 BAN_API_KEY = os.getenv("BAN_API_KEY")
 ban_records = {}
+inventory_records = {}
 
 
 def now_iso():
@@ -1268,6 +1269,56 @@ def remove_ban_by_user_id_alias(user_id):
         "target_user_id": str(user_id),
         "source": "roblox_open_cloud",
     }), 200
+
+
+@app.route("/inventory/<int:user_id>", methods=["GET"])
+def get_inventory(user_id):
+    """Return the latest inventory scan cached by the in-game server."""
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    record = inventory_records.get(str(user_id))
+    if not record:
+        return {"error": "Not found"}, 404
+
+    return jsonify(record), 200
+
+
+@app.route("/inventory/scan", methods=["POST"])
+def save_inventory_scan():
+    """Save an inventory scan from Roblox.
+
+    The Roblox plugin sends InvData.Safe:GetItems() as safe_items and
+    BackpackData.Backpack:GetItems() as backpack_items. This gives Discord
+    an offline cache with a Last Scanned timestamp.
+    """
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    data = request.json or {}
+    user_id = data.get("user_id") or data.get("roblox_user_id") or data.get("target_user_id")
+
+    if not user_id:
+        return {"error": "user_id is required"}, 400
+
+    try:
+        user_id_int = int(user_id)
+    except Exception:
+        return {"error": "user_id must be a valid Roblox user ID"}, 400
+
+    record = {
+        "user_id": user_id_int,
+        "target_name": data.get("target_name") or data.get("username") or data.get("name") or "Unknown",
+        "safe_items": data.get("safe_items") or data.get("safe") or [],
+        "backpack_items": data.get("backpack_items") or data.get("backpack") or [],
+        "last_scanned": data.get("last_scanned") or data.get("lastScanned") or now_iso(),
+        "place_id": data.get("place_id"),
+        "job_id": data.get("job_id"),
+        "updated_at": now_iso(),
+    }
+
+    inventory_records[str(user_id_int)] = record
+    return jsonify({"success": True, "record": record}), 200
 
 
 @app.route("/ban-records/game-pending", methods=["GET"])
