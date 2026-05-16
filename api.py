@@ -468,12 +468,17 @@ def http_request_json_with_headers(method, url, headers, payload=None):
         raise RuntimeError(f"Roblox Open Cloud returned invalid JSON: {e}")
 
 
+def is_roblox_rate_limited(error_text):
+    text = str(error_text)
+    return "HTTP 429" in text or "RESOURCE_EXHAUSTED" in text or "too many requests" in text.lower()
+
+
 def roblox_unban_user_restriction(user_id):
     """Remove an active Roblox Ban API / Creator Hub user restriction.
 
-    Tries PATCH active=false first, then DELETE, for universe and optional
-    place-level restriction paths. This handles manual dashboard bans that are
-    not stored in this API's in-memory ban_records.
+    Roblox's Update User Restriction endpoint expects the whole
+    gameJoinRestriction object to be patched atomically. Do not spam several
+    fallback payload shapes; that causes 429 rate limits.
     """
     config_error = require_roblox_open_cloud_config()
     if config_error:
@@ -483,40 +488,55 @@ def roblox_unban_user_restriction(user_id):
     restriction_id = quote(str(int(user_id)), safe="")
     headers = roblox_open_cloud_headers()
 
-    urls = [
+    bases = [
         f"https://apis.roblox.com/cloud/v2/universes/{universe}/user-restrictions/{restriction_id}",
     ]
 
     if ROBLOX_PLACE_ID:
         place = quote(str(ROBLOX_PLACE_ID), safe="")
-        urls.append(
+        bases.append(
             f"https://apis.roblox.com/cloud/v2/universes/{universe}/places/{place}/user-restrictions/{restriction_id}"
         )
 
-    payloads = [
-        {"gameJoinRestriction": {"active": False}},
-        {"restriction": {"active": False}},
-        {"active": False},
-    ]
+    # Full object required. Field masks into gameJoinRestriction.active are not
+    # supported by Roblox; patch the whole game_join_restriction field.
+    payload = {
+        "gameJoinRestriction": {
+            "active": False,
+            "duration": "0",
+            "privateReason": "Unbanned from Discord moderation panel",
+            "displayReason": "Unbanned",
+            "excludeAltAccounts": False,
+        }
+    }
 
     errors = []
-    for url in urls:
-        for payload in payloads:
-            try:
-                return http_request_json_with_headers("PATCH", url, headers, payload)
-            except Exception as e:
-                text = str(e)
-                if "404" in text or "NOT_FOUND" in text.upper() or "not found" in text.lower():
-                    errors.append(text)
-                    break
-                errors.append(text)
-
+    for base in bases:
+        url = f"{base}?updateMask=game_join_restriction"
         try:
-            return http_request_json_with_headers("DELETE", url, headers, None)
+            return http_request_json_with_headers("PATCH", url, headers, payload)
         except Exception as e:
-            errors.append(str(e))
+            text = str(e)
 
-    raise RuntimeError(" ; ".join(errors) if errors else "Unable to remove Roblox user restriction")
+            # 429 means Roblox accepted too many recent restriction requests for
+            # this same user. Stop immediately instead of trying more endpoints.
+            if is_roblox_rate_limited(text):
+                raise RuntimeError(
+                    "Roblox Open Cloud rate-limited this user restriction request. "
+                    "Wait 1-2 minutes, then click Remove Ban again. "
+                    f"Details: {text}"
+                )
+
+            # If the universe-level restriction does not exist, try optional
+            # place-level restriction next.
+            if "404" in text or "NOT_FOUND" in text.upper() or "not found" in text.lower():
+                errors.append(text)
+                continue
+
+            # 400/permission/etc. are real errors; do not keep spamming.
+            raise RuntimeError(text)
+
+    raise RuntimeError("No matching Roblox user restriction was found to remove. " + (" ; ".join(errors) if errors else ""))
 
 
 def _pick_first(*values):
@@ -1088,10 +1108,16 @@ def remove_ban():
         try:
             roblox_unban_user_restriction(int(target_user_id))
         except Exception as e:
+            details = str(e)
+            hint = (
+                "Roblox rate-limited this user restriction. Wait 1-2 minutes and try again."
+                if is_roblox_rate_limited(details)
+                else "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions write access."
+            )
             return jsonify({
                 "error": "Failed to remove Roblox Open Cloud user restriction",
-                "details": str(e),
-                "hint": "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions write access."
+                "details": details,
+                "hint": hint
             }), 502
 
         manual_id = ban_id or f"ROBLOX-{int(target_user_id)}"
