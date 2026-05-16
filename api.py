@@ -443,6 +443,82 @@ def roblox_get_user_restriction(user_id):
     return None
 
 
+def http_request_json_with_headers(method, url, headers, payload=None):
+    body = None
+    req_headers = dict(headers)
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+
+    req = Request(url, data=body, method=method, headers=req_headers)
+
+    try:
+        with urlopen(req, timeout=15) as resp:
+            response_body = resp.read().decode("utf-8")
+            if not response_body:
+                return {}
+            return json.loads(response_body)
+    except HTTPError as e:
+        response_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Roblox Open Cloud HTTP {e.code}: {response_body}")
+    except URLError as e:
+        raise RuntimeError(f"Roblox Open Cloud request failed: {e}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Roblox Open Cloud returned invalid JSON: {e}")
+
+
+def roblox_unban_user_restriction(user_id):
+    """Remove an active Roblox Ban API / Creator Hub user restriction.
+
+    Tries PATCH active=false first, then DELETE, for universe and optional
+    place-level restriction paths. This handles manual dashboard bans that are
+    not stored in this API's in-memory ban_records.
+    """
+    config_error = require_roblox_open_cloud_config()
+    if config_error:
+        raise RuntimeError(config_error)
+
+    universe = quote(str(ROBLOX_UNIVERSE_ID), safe="")
+    restriction_id = quote(str(int(user_id)), safe="")
+    headers = roblox_open_cloud_headers()
+
+    urls = [
+        f"https://apis.roblox.com/cloud/v2/universes/{universe}/user-restrictions/{restriction_id}",
+    ]
+
+    if ROBLOX_PLACE_ID:
+        place = quote(str(ROBLOX_PLACE_ID), safe="")
+        urls.append(
+            f"https://apis.roblox.com/cloud/v2/universes/{universe}/places/{place}/user-restrictions/{restriction_id}"
+        )
+
+    payloads = [
+        {"gameJoinRestriction": {"active": False}},
+        {"restriction": {"active": False}},
+        {"active": False},
+    ]
+
+    errors = []
+    for url in urls:
+        for payload in payloads:
+            try:
+                return http_request_json_with_headers("PATCH", url, headers, payload)
+            except Exception as e:
+                text = str(e)
+                if "404" in text or "NOT_FOUND" in text.upper() or "not found" in text.lower():
+                    errors.append(text)
+                    break
+                errors.append(text)
+
+        try:
+            return http_request_json_with_headers("DELETE", url, headers, None)
+        except Exception as e:
+            errors.append(str(e))
+
+    raise RuntimeError(" ; ".join(errors) if errors else "Unable to remove Roblox user restriction")
+
+
 def _pick_first(*values):
     for value in values:
         if value is not None and str(value).strip() != "":
@@ -982,28 +1058,125 @@ def remove_ban():
 
     data = request.json or {}
     ban_id = data.get("ban_id")
-    if not ban_id:
-        return {"error": "ban_id is required"}, 400
+    target_user_id = data.get("target_user_id") or data.get("user_id") or data.get("roblox_user_id")
 
-    if ban_id not in ban_records:
-        return {"error": "Not found"}, 404
+    if not ban_id and not target_user_id:
+        return {"error": "ban_id or target_user_id is required"}, 400
 
-    record = ban_records[ban_id]
-    record["ban_id"] = ban_id
-    record["status"] = "remove_pending"
-    record["processed_by_game"] = False
-    record["processed_at"] = None
-    record["game_success"] = None
-    record["game_message"] = None
-    record["game_place_id"] = None
-    record["game_job_id"] = None
-    record["removed_by_discord_id"] = data.get("removed_by_discord_id")
-    record["removed_by_name"] = data.get("removed_by_name")
-    record["updated_at"] = now_iso()
-    record["roblox_last_action"] = "remove"
+    # Normal bot-created bans: mark the existing record for the in-game worker.
+    if ban_id and ban_id in ban_records:
+        record = ban_records[ban_id]
+        record["ban_id"] = ban_id
+        record["status"] = "remove_pending"
+        record["processed_by_game"] = False
+        record["processed_at"] = None
+        record["game_success"] = None
+        record["game_message"] = None
+        record["game_place_id"] = None
+        record["game_job_id"] = None
+        record["removed_by_discord_id"] = data.get("removed_by_discord_id")
+        record["removed_by_name"] = data.get("removed_by_name")
+        record["updated_at"] = now_iso()
+        record["roblox_last_action"] = "remove"
 
-    ban_records[ban_id] = record
-    return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
+        ban_records[ban_id] = record
+        return {"success": True, "ban_id": ban_id, "status": record["status"]}, 200
+
+    # Manual Creator Hub / Open Cloud bans do not exist in this API's RAM.
+    # Remove them directly by Roblox user ID.
+    if target_user_id:
+        try:
+            roblox_unban_user_restriction(int(target_user_id))
+        except Exception as e:
+            return jsonify({
+                "error": "Failed to remove Roblox Open Cloud user restriction",
+                "details": str(e),
+                "hint": "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions write access."
+            }), 502
+
+        manual_id = ban_id or f"ROBLOX-{int(target_user_id)}"
+        ban_records[manual_id] = apply_record_defaults({
+            "ban_id": manual_id,
+            "status": "unbanned",
+            "request_type": "manual_or_open_cloud_unban",
+            "platform": "roblox",
+            "target_user_id": str(target_user_id),
+            "target_name": data.get("target_name"),
+            "removed_by_discord_id": data.get("removed_by_discord_id"),
+            "removed_by_name": data.get("removed_by_name"),
+            "roblox_enforced": False,
+            "roblox_last_action": "remove",
+            "processed_by_game": True,
+            "processed_at": now_iso(),
+            "game_success": True,
+            "game_message": "Removed directly through Roblox Open Cloud",
+        }, manual_id, source="roblox_open_cloud")
+
+        return jsonify({
+            "success": True,
+            "ban_id": manual_id,
+            "status": "unbanned",
+            "target_user_id": str(target_user_id),
+            "source": "roblox_open_cloud",
+        }), 200
+
+    return {"error": "Not found"}, 404
+
+
+@app.route("/ban-records/unban", methods=["POST"])
+@app.route("/ban-records/delete", methods=["POST"])
+@app.route("/ban-records/revoke", methods=["POST"])
+def remove_ban_alias():
+    return remove_ban()
+
+
+@app.route("/ban-records/roblox/<int:user_id>/remove", methods=["POST"])
+@app.route("/ban-records/roblox/<int:user_id>/unban", methods=["POST"])
+@app.route("/ban-records/user/<int:user_id>/remove", methods=["POST"])
+@app.route("/ban-records/user/<int:user_id>/unban", methods=["POST"])
+def remove_ban_by_user_id_alias(user_id):
+    data = request.json or {}
+    data["target_user_id"] = str(user_id)
+
+    # Patch request.json usage by temporarily replacing request cached json
+    # is messy in Flask, so call the underlying logic through a copied payload.
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    try:
+        roblox_unban_user_restriction(int(user_id))
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to remove Roblox Open Cloud user restriction",
+            "details": str(e),
+            "hint": "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions write access."
+        }), 502
+
+    manual_id = data.get("ban_id") or f"ROBLOX-{int(user_id)}"
+    ban_records[manual_id] = apply_record_defaults({
+        "ban_id": manual_id,
+        "status": "unbanned",
+        "request_type": "manual_or_open_cloud_unban",
+        "platform": "roblox",
+        "target_user_id": str(user_id),
+        "target_name": data.get("target_name"),
+        "removed_by_discord_id": data.get("removed_by_discord_id"),
+        "removed_by_name": data.get("removed_by_name"),
+        "roblox_enforced": False,
+        "roblox_last_action": "remove",
+        "processed_by_game": True,
+        "processed_at": now_iso(),
+        "game_success": True,
+        "game_message": "Removed directly through Roblox Open Cloud",
+    }, manual_id, source="roblox_open_cloud")
+
+    return jsonify({
+        "success": True,
+        "ban_id": manual_id,
+        "status": "unbanned",
+        "target_user_id": str(user_id),
+        "source": "roblox_open_cloud",
+    }), 200
 
 
 @app.route("/ban-records/game-pending", methods=["GET"])
