@@ -569,8 +569,26 @@ def normalize_open_cloud_restriction(user_id, raw):
         raw.get("isActive"),
         raw.get("currentlyActive"),
     )
+
     if isinstance(active, str):
-        active = active.strip().lower() in {"true", "1", "yes", "active"}
+        text_active = active.strip().lower()
+        if text_active in {"false", "0", "no", "inactive", "expired", "unbanned"}:
+            active = False
+        elif text_active in {"true", "1", "yes", "active", "banned"}:
+            active = True
+        else:
+            active = None
+
+    # Roblox Open Cloud/List User Restrictions can return an existing active
+    # restriction without a clean boolean active field. If we found the user's
+    # restriction object at all, treat it as active unless it explicitly says
+    # inactive/expired/unbanned.
+    if active is None:
+        status_text = str(_pick_first(raw.get("status"), restriction.get("status"), raw.get("state"), restriction.get("state"), "")).strip().lower()
+        if status_text in {"inactive", "expired", "unbanned", "removed", "revoked"}:
+            active = False
+        else:
+            active = True
 
     display_reason = _pick_first(
         restriction.get("displayReason"),
@@ -617,7 +635,7 @@ def normalize_open_cloud_restriction(user_id, raw):
         created_at,
     )
 
-    status = "completed" if active is True else "unbanned" if active is False else "unknown"
+    status = "completed" if active is True else "unbanned"
 
     ban_id = _pick_first(
         raw.get("ban_id"),
@@ -936,6 +954,29 @@ def search_ban_records():
         "count": len(records),
         "records": records
     }), 200
+
+
+@app.route("/debug/roblox-restriction/<int:user_id>", methods=["GET"])
+def debug_roblox_restriction(user_id):
+    """Debug raw Roblox Open Cloud restriction lookup for one user."""
+    if not check_auth(request):
+        return {"error": "Unauthorized"}, 401
+
+    try:
+        raw = roblox_get_user_restriction(user_id)
+        normalized = normalize_open_cloud_restriction(user_id, raw) if raw else None
+        return jsonify({
+            "user_id": user_id,
+            "found": raw is not None,
+            "raw": raw,
+            "normalized": normalized,
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "user_id": user_id,
+            "error": str(e),
+            "hint": "Check Open Cloud key permissions and whether the ban is universe-level or place-level.",
+        }), 502
 
 
 @app.route("/ban-records/active/roblox/<int:user_id>", methods=["GET"])
