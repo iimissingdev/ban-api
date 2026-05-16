@@ -503,7 +503,6 @@ def roblox_unban_user_restriction(user_id):
     payload = {
         "gameJoinRestriction": {
             "active": False,
-            "duration": "0",
             "privateReason": "Unbanned from Discord moderation panel",
             "displayReason": "Unbanned",
             "excludeAltAccounts": False,
@@ -1153,6 +1152,8 @@ def remove_ban():
             hint = (
                 "Roblox rate-limited this user restriction. Wait 1-2 minutes and try again."
                 if is_roblox_rate_limited(details)
+                else "Roblox rejected the unban PATCH. Make sure this deployed API version does not send duration=0 and that the key has user-restrictions write access."
+                if "Invalid Duration value" in details
                 else "Check ROBLOX_OPEN_CLOUD_API_KEY, ROBLOX_UNIVERSE_ID, optional ROBLOX_PLACE_ID, and user-restrictions write access."
             )
             return jsonify({
