@@ -104,6 +104,14 @@ def apply_record_defaults(data, ban_id, source="bot"):
     data["game_job_id"] = data.get("game_job_id")
     data["roblox_enforced"] = data.get("roblox_enforced", False)
     data["roblox_last_action"] = data.get("roblox_last_action", "manual_staff_ban" if source == "manual_staff" else data.get("roblox_last_action"))
+
+    # Roblox alt-account enforcement:
+    # BanAsync/Open Cloud uses ExcludeAltAccounts/excludeAltAccounts.
+    # False means DO NOT exclude alts, so alt accounts are included in the ban.
+    data["exclude_alt_accounts"] = data.get("exclude_alt_accounts", data.get("excludeAltAccounts", False))
+    data["excludeAltAccounts"] = data.get("excludeAltAccounts", data.get("exclude_alt_accounts", False))
+    data["ban_alt_accounts"] = data.get("ban_alt_accounts", True)
+
     return data
 
 
@@ -663,6 +671,9 @@ def normalize_open_cloud_restriction(user_id, raw):
         "active": active is True,
         "roblox_enforced": True,
         "source": "roblox_open_cloud",
+        "exclude_alt_accounts": False,
+        "excludeAltAccounts": False,
+        "ban_alt_accounts": True,
         "raw_open_cloud": raw,
     }
 
@@ -725,6 +736,9 @@ def ban_status(user_id):
         "display_reason": f"Automated Ban - {active_record.get('ban_id')}",
         "target_name": active_record.get("target_name"),
         "apply_to_universe": True,
+        "exclude_alt_accounts": active_record.get("exclude_alt_accounts", False),
+        "excludeAltAccounts": active_record.get("excludeAltAccounts", False),
+        "ban_alt_accounts": active_record.get("ban_alt_accounts", True),
     }), 200
 
 
@@ -810,6 +824,9 @@ def execute_ban():
     record.update(data)
     record["ban_id"] = ban_id
     record["updated_at"] = now_iso()
+    record["exclude_alt_accounts"] = data.get("exclude_alt_accounts", data.get("excludeAltAccounts", False))
+    record["excludeAltAccounts"] = data.get("excludeAltAccounts", data.get("exclude_alt_accounts", False))
+    record["ban_alt_accounts"] = data.get("ban_alt_accounts", True)
     record["processed_by_game"] = False
     record["processed_at"] = None
     record["game_success"] = None
@@ -855,6 +872,9 @@ def create_manual_staff_ban():
     data["approved_by_discord_id"] = data.get("approved_by_discord_id") or data.get("staff_discord_id")
     data["approved_by_name"] = data.get("approved_by_name") or data.get("staff_name")
     data["adonis_command"] = data.get("adonis_command", "Manual staff ban")
+    data["exclude_alt_accounts"] = data.get("exclude_alt_accounts", data.get("excludeAltAccounts", False))
+    data["excludeAltAccounts"] = data.get("excludeAltAccounts", data.get("exclude_alt_accounts", False))
+    data["ban_alt_accounts"] = data.get("ban_alt_accounts", True)
     data = apply_record_defaults(data, ban_id, source="manual_staff")
 
     ban_records[ban_id] = data
@@ -1088,6 +1108,9 @@ def update_ban():
         "proof",
         "target_name",
         "target_user_id",
+        "exclude_alt_accounts",
+        "excludeAltAccounts",
+        "ban_alt_accounts",
     }
 
     for key in editable_fields:
